@@ -1,0 +1,712 @@
+let
+    // ============================================================
+    // SOURCE SETTINGS
+    // Update these two values for the client/source environment
+    // ============================================================
+
+    SharePointSite = "https://company.sharepoint.com/sites/YourSite/",
+    SourceFolder = "https://company.sharepoint.com/sites/YourSite/Shared Documents/VMR/",
+
+    // ============================================================
+    // SOURCE FILES
+    // ============================================================
+
+    Source =
+        SharePoint.Files(
+            SharePointSite,
+            [ApiVersion = 15]
+        ),
+
+    #"Filtered Folder" =
+        Table.SelectRows(
+            Source,
+            each [Folder Path] = SourceFolder
+        ),
+
+    #"Filtered Hidden Files" =
+        Table.SelectRows(
+            #"Filtered Folder",
+            each [Attributes]?[Hidden]? <> true
+        ),
+
+    #"Sorted Files" =
+        Table.Sort(
+            #"Filtered Hidden Files",
+            {{"Name", Order.Ascending}}
+        ),
+
+    // ============================================================
+    // FILTER TO THE REQUIRED EXTRACTION PERIOD
+    // Keeps the original rolling 12-month logic
+    // ============================================================
+
+    #"Filtered Period" =
+        Table.SelectRows(
+            #"Sorted Files",
+            each
+                try
+                    Number.From(
+                        Text.BetweenDelimiters(
+                            [Name],
+                            "_Extract_",
+                            "_"
+                        )
+                    )
+                    >=
+                    Number.FromText(
+                        Date.ToText(
+                            Date.AddMonths(
+                                #date(
+                                    Number.IntegerDivide(
+                                        List.Max(
+                                            List.Transform(
+                                                #"Filtered Hidden Files"[Name],
+                                                each
+                                                    Number.From(
+                                                        Text.BetweenDelimiters(
+                                                            _,
+                                                            "_Extract_",
+                                                            "_"
+                                                        )
+                                                    )
+                                            )
+                                        ),
+                                        100
+                                    ),
+                                    Number.Mod(
+                                        List.Max(
+                                            List.Transform(
+                                                #"Filtered Hidden Files"[Name],
+                                                each
+                                                    Number.From(
+                                                        Text.BetweenDelimiters(
+                                                            _,
+                                                            "_Extract_",
+                                                            "_"
+                                                        )
+                                                    )
+                                            )
+                                        ),
+                                        100
+                                    ),
+                                    1
+                                ),
+                                -11
+                            ),
+                            "yyyyMM"
+                        )
+                    )
+                otherwise false
+        ),
+
+    // ============================================================
+    // TRANSFORM SOURCE FILES
+    // ============================================================
+
+    #"Invoke Custom Function" =
+        Table.AddColumn(
+            #"Filtered Period",
+            "Transformed Data",
+            each #"Transform File"([Content])
+        ),
+
+    #"Renamed Source" =
+        Table.RenameColumns(
+            #"Invoke Custom Function",
+            {
+                {"Name", "Source Name"}
+            }
+        ),
+
+    #"Selected Source Columns" =
+        Table.SelectColumns(
+            #"Renamed Source",
+            {
+                "Source Name",
+                "Transformed Data"
+            }
+        ),
+
+    #"Expanded Source Data" =
+        Table.ExpandTableColumn(
+            #"Selected Source Columns",
+            "Transformed Data",
+            Table.ColumnNames(
+                #"Transform File"(#"Sample File")
+            )
+        ),
+
+    // ============================================================
+    // STANDARDIZE SOURCE COLUMN NAMES
+    // ============================================================
+
+    #"Renamed Source Columns" =
+        Table.RenameColumns(
+            #"Expanded Source Data",
+            {
+                {"BranchID", "BranchCode"},
+                {"CycleNbr", "Period"},
+                {"WeekNbr", "Week"},
+                {"InvtID", "ItemCode"},
+                {"ItemDescr", "Item Description"},
+                {"SiteID", "SiteID"},
+                {"WhArea", "WarehouseArea"},
+                {"WhAreaDescr", "Warehouse Location"},
+                {"QTY", "Quantity"},
+                {"GTS", "GrossSales"},
+                {"DISCOUNT", "Discount"},
+                {"NTS", "NetSales"}
+            },
+            MissingField.Ignore
+        ),
+
+    // ============================================================
+    // DATA TYPES
+    // ============================================================
+
+    #"Changed Type" =
+        Table.TransformColumnTypes(
+            #"Renamed Source Columns",
+            {
+                {"Source Name", type text},
+                {"BranchCode", type text},
+                {"Period", type text},
+                {"Week", type text},
+                {"ItemCode", type text},
+                {"Item Description", type text},
+                {"SiteID", type text},
+                {"WarehouseArea", type text},
+                {"Warehouse Location", type text},
+                {"Quantity", type number},
+                {"GrossSales", type number},
+                {"Discount", Int64.Type},
+                {"NetSales", type number}
+            },
+            "en-US"
+        ),
+
+    // ============================================================
+    // REMOVE UNUSED SOURCE COLUMNS
+    // ============================================================
+
+    #"Removed Unnecessary Columns" =
+        Table.RemoveColumns(
+            #"Changed Type",
+            {
+                "Source Name",
+                "GrossSales",
+                "Discount",
+                "NetSales"
+            },
+            MissingField.Ignore
+        ),
+
+    // ============================================================
+    // CLEAN ITEM CODE
+    // ============================================================
+
+    #"Replaced Item Code Errors" =
+        Table.ReplaceErrorValues(
+            #"Removed Unnecessary Columns",
+            {
+                {"ItemCode", "0"}
+            }
+        ),
+
+    // ============================================================
+    // CREATE BRANCH + SITE KEY
+    // ============================================================
+
+    #"Added Concatenate" =
+        Table.AddColumn(
+            #"Replaced Item Code Errors",
+            "Concatenate",
+            each
+                Text.From([BranchCode]) &
+                Text.From([SiteID]),
+            type text
+        ),
+
+    #"Replaced Concatenate Errors" =
+        Table.ReplaceErrorValues(
+            #"Added Concatenate",
+            {
+                {"Concatenate", " "}
+            }
+        ),
+
+    // ============================================================
+    // DISTRIBUTOR / CUSTOMER MAPPING
+    // ============================================================
+
+    #"Mapped Distributor" =
+        Table.NestedJoin(
+            #"Replaced Concatenate Errors",
+            {"BranchCode"},
+            #"Customer Mapping (2) - DC",
+            {"Distributor Code"},
+            "Customer Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Distributor" =
+        Table.ExpandTableColumn(
+            #"Mapped Distributor",
+            "Customer Mapping",
+            {"Distributor"},
+            {"Distributor"}
+        ),
+
+    // ============================================================
+    // CUSTOMER FILTER
+    // Distributor + Warehouse Location
+    // ============================================================
+
+    #"Added Customer Filter" =
+        Table.AddColumn(
+            #"Expanded Distributor",
+            "Customer Filter",
+            each
+                Text.From([Distributor]) &
+                "-" &
+                Text.From([Warehouse Location]),
+            type text
+        ),
+
+    // ============================================================
+    // CLEAN QUANTITY
+    // Negative quantities become zero
+    // ============================================================
+
+    #"Added Clean Quantity" =
+        Table.AddColumn(
+            #"Added Customer Filter",
+            "Clean Quantity",
+            each
+                if [Quantity] < 0
+                then 0
+                else [Quantity],
+            type number
+        ),
+
+    // ============================================================
+    // ITEM CODE → MASTER CODE
+    // ============================================================
+
+    #"Mapped Master Code" =
+        Table.NestedJoin(
+            #"Added Clean Quantity",
+            {"ItemCode"},
+            #"Master Code Mapping (2) - Item Code",
+            {"ITEM CODE"},
+            "Master Code Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Master Code" =
+        Table.ExpandTableColumn(
+            #"Mapped Master Code",
+            "Master Code Mapping",
+            {"MASTERCODE"},
+            {"Master Code"}
+        ),
+
+    #"Changed Master Code Type" =
+        Table.TransformColumnTypes(
+            #"Expanded Master Code",
+            {
+                {"Master Code", type text}
+            }
+        ),
+
+    #"Replaced Master Code Null" =
+        Table.ReplaceValue(
+            #"Changed Master Code Type",
+            null,
+            " ",
+            Replacer.ReplaceValue,
+            {"Master Code"}
+        ),
+
+    // ============================================================
+    // MASTER CODE → ACTIVE SKU
+    // ============================================================
+
+    #"Mapped Active SKU" =
+        Table.NestedJoin(
+            #"Replaced Master Code Null",
+            {"Master Code"},
+            #"Active SKUs (2) - Master Code",
+            {"MASTERCODE"},
+            "Active SKU Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Active SKU" =
+        Table.ExpandTableColumn(
+            #"Mapped Active SKU",
+            "Active SKU Mapping",
+            {"ITEM CODE"},
+            {"Active SKU Item Code"}
+        ),
+
+    // ============================================================
+    // MASTER CODE → FT CODE
+    // ============================================================
+
+    #"Mapped FT Code" =
+        Table.NestedJoin(
+            #"Expanded Active SKU",
+            {"Master Code"},
+            #"FT (2) - Master Code",
+            {"MASTERCODE"},
+            "FT Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded FT Code" =
+        Table.ExpandTableColumn(
+            #"Mapped FT Code",
+            "FT Mapping",
+            {"ITEM CODE"},
+            {"FT Item Code"}
+        ),
+
+    // ============================================================
+    // ACTIVE CODE
+    // Active SKU takes priority over FT
+    // ============================================================
+
+    #"Added Active Code" =
+        Table.AddColumn(
+            #"Expanded FT Code",
+            "Active Code",
+            each
+                if [Active SKU Item Code] <> null
+                then [Active SKU Item Code]
+                else [FT Item Code],
+            type text
+        ),
+
+    #"Replaced Active Code Null" =
+        Table.ReplaceValue(
+            #"Added Active Code",
+            null,
+            " ",
+            Replacer.ReplaceValue,
+            {"Active Code"}
+        ),
+
+    // ============================================================
+    // MASTER CODE → ITEM DESCRIPTION
+    // ============================================================
+
+    #"Mapped Item Description" =
+        Table.NestedJoin(
+            #"Replaced Active Code Null",
+            {"Master Code"},
+            #"Active SKUs (2) - Master Code",
+            {"MASTERCODE"},
+            "Item Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Item Description" =
+        Table.ExpandTableColumn(
+            #"Mapped Item Description",
+            "Item Mapping",
+            {"DESCRIPTION"},
+            {"Mapped Item Description"}
+        ),
+
+    #"Removed Temporary Code Columns" =
+        Table.RemoveColumns(
+            #"Expanded Item Description",
+            {
+                "FT Item Code",
+                "Active SKU Item Code"
+            },
+            MissingField.Ignore
+        ),
+
+    #"Changed Item Description Type" =
+        Table.TransformColumnTypes(
+            #"Removed Temporary Code Columns",
+            {
+                {"Mapped Item Description", type text}
+            }
+        ),
+
+    #"Replaced Item Description Null" =
+        Table.ReplaceValue(
+            #"Changed Item Description Type",
+            null,
+            " ",
+            Replacer.ReplaceValue,
+            {"Mapped Item Description"}
+        ),
+
+    // ============================================================
+    // ACTIVE CODE → LIST PRICE
+    // ============================================================
+
+    #"Mapped List Price" =
+        Table.NestedJoin(
+            #"Replaced Item Description Null",
+            {"Active Code"},
+            #"List Price (2) -Material",
+            {"Material"},
+            "List Price Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded List Price" =
+        Table.ExpandTableColumn(
+            #"Mapped List Price",
+            "List Price Mapping",
+            {"List Price/PC"},
+            {"List Price"}
+        ),
+
+    #"Replaced List Price Null" =
+        Table.ReplaceValue(
+            #"Expanded List Price",
+            null,
+            0,
+            Replacer.ReplaceValue,
+            {"List Price"}
+        ),
+
+    // ============================================================
+    // VALUE CALCULATION
+    // List Price × Clean Quantity
+    // ============================================================
+
+    #"Calculated Value" =
+        Table.AddColumn(
+            #"Replaced List Price Null",
+            "Value",
+            each
+                try
+                    if [Clean Quantity] = 0
+                    then 0
+                    else [List Price] * [Clean Quantity]
+                otherwise 0,
+            type number
+        ),
+
+    // ============================================================
+    // ACTIVE CODE → REGULAR / NPI / PROMO
+    // ============================================================
+
+    #"Mapped Product Classification" =
+        Table.NestedJoin(
+            #"Calculated Value",
+            {"Active Code"},
+            #"Master Code Mapping (2) - Item Code",
+            {"ITEM CODE"},
+            "Product Classification Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Product Classification" =
+        Table.ExpandTableColumn(
+            #"Mapped Product Classification",
+            "Product Classification Mapping",
+            {"Regular/ NPI/Promo"},
+            {"Regular/ NPI/Promo"}
+        ),
+
+    #"Changed Product Classification Type" =
+        Table.TransformColumnTypes(
+            #"Expanded Product Classification",
+            {
+                {"Regular/ NPI/Promo", type text}
+            }
+        ),
+
+    // ============================================================
+    // MASTER CODE → BASE / OTC
+    // ============================================================
+
+    #"Mapped Product Type" =
+        Table.NestedJoin(
+            #"Changed Product Classification Type",
+            {"Master Code"},
+            #"Master Code Mapping (2) - Master Code",
+            {"MASTERCODE"},
+            "Product Type Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Product Type" =
+        Table.ExpandTableColumn(
+            #"Mapped Product Type",
+            "Product Type Mapping",
+            {"BASE/OTC"},
+            {"BASE/OTC"}
+        ),
+
+    #"Changed Product Type" =
+        Table.TransformColumnTypes(
+            #"Expanded Product Type",
+            {
+                {"BASE/OTC", type text}
+            }
+        ),
+
+    // ============================================================
+    // MASTER CODE → ACTIVE STATUS
+    // ============================================================
+
+    #"Mapped Active Status" =
+        Table.NestedJoin(
+            #"Changed Product Type",
+            {"Master Code"},
+            #"Active SKUs (2) - Master Code",
+            {"MASTERCODE"},
+            "Active Status Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded Active Status" =
+        Table.ExpandTableColumn(
+            #"Mapped Active Status",
+            "Active Status Mapping",
+            {"Status"},
+            {"Active Status"}
+        ),
+
+    #"Changed Active Status Type" =
+        Table.TransformColumnTypes(
+            #"Expanded Active Status",
+            {
+                {"Active Status", type text}
+            }
+        ),
+
+    #"Replaced Active Status Null" =
+        Table.ReplaceValue(
+            #"Changed Active Status Type",
+            null,
+            "No Forecast",
+            Replacer.ReplaceValue,
+            {"Active Status"}
+        ),
+
+    // ============================================================
+    // WAREHOUSE AREA → DN
+    // ============================================================
+
+    #"Mapped DN" =
+        Table.NestedJoin(
+            #"Replaced Active Status Null",
+            {"WarehouseArea"},
+            #"Customer Mapping (2) - Warehouse Area",
+            {"Warehouse Area"},
+            "Warehouse Mapping",
+            JoinKind.LeftOuter
+        ),
+
+    #"Expanded DN" =
+        Table.ExpandTableColumn(
+            #"Mapped DN",
+            "Warehouse Mapping",
+            {"DN"},
+            {"DN"}
+        ),
+
+    // ============================================================
+    // PERIOD → MONTH
+    // Expected Period format: YYYYMM
+    // ============================================================
+
+    #"Added Month" =
+        Table.AddColumn(
+            #"Expanded DN",
+            "Month",
+            each
+                Date.MonthName(
+                    #date(
+                        Number.From(
+                            Text.Start(
+                                Text.From([Period]),
+                                4
+                            )
+                        ),
+                        Number.From(
+                            Text.End(
+                                Text.From([Period]),
+                                2
+                            )
+                        ),
+                        1
+                    )
+                ),
+            type text
+        ),
+
+    // ============================================================
+    // STANDARDIZE UNMAPPED VALUES
+    // ============================================================
+
+    #"Replaced Null Values" =
+        Table.ReplaceValue(
+            #"Added Month",
+            null,
+            "#N/A",
+            Replacer.ReplaceValue,
+            {
+                "Active Code",
+                "Master Code",
+                "Regular/ NPI/Promo",
+                "BASE/OTC"
+            }
+        ),
+
+    // ============================================================
+    // FINAL DATA TYPES
+    // ============================================================
+
+    #"Changed Final Types" =
+        Table.TransformColumnTypes(
+            #"Replaced Null Values",
+            {
+                {"Regular/ NPI/Promo", type text},
+                {"BASE/OTC", type text},
+                {"Concatenate", type text},
+                {"Customer Filter", type text},
+                {"Distributor", type text},
+                {"Month", type text},
+                {"BranchCode", type text},
+                {"Period", type text},
+                {"Week", type text},
+                {"ItemCode", type text},
+                {"Item Description", type text},
+                {"SiteID", type text},
+                {"WarehouseArea", type text},
+                {"Warehouse Location", type text},
+                {"Value", type number}
+            }
+        ),
+
+    // ============================================================
+    // FINAL KEY
+    // Preserves the original key-generation logic
+    // ============================================================
+
+    #"Added Key" =
+        Table.AddColumn(
+            #"Changed Final Types",
+            "Key",
+            each
+                List.Sort(
+                    List.Skip(
+                        Record.ToList(_),
+                        6
+                    )
+                )
+        )
+
+in
+    #"Added Key"
